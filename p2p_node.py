@@ -2,289 +2,403 @@ import socket
 import threading
 import argparse
 import json # Necessário para lidar com mensagens JSON
-import uuid # Para gerar task_ids, embora create_task_message já faça isso
+import uuid # Para gerar task_ids
 
-# Importar funções do message_formats.py
-from message_formats import create_task_message, create_result_message, parse_message
+# Importações de message_formats são feitas localmente nos métodos ou no if __name__
 
 class P2PNode:
     def __init__(self, host, port, initial_peers=None):
         self.host = host
         self.port = port
+        self.node_id = f"{self.host}:{self.port}"
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Allow address reuse
-        self.peers = [] # List to store connected peer sockets
-        self.lock = threading.Lock() # Lock for thread-safe access to self.peers
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.peers = []
+        self.lock = threading.Lock() # Lock para self.peers
+
+        self.offered_tasks = {}
+        self.processing_tasks = {} # Tarefas que este nó está processando para outros
+        self.task_pool_lock = threading.Lock()
 
         if initial_peers is None:
             initial_peers = []
-
-        # Connect to initial peers
-        for peer_host, peer_port in initial_peers:
-            self.connect_to_peer(peer_host, int(peer_port))
+        for peer_host, peer_port_val in initial_peers:
+            self.connect_to_peer(peer_host, int(peer_port_val))
 
     def start_listening(self):
-        """
-        Starts a thread to listen for incoming connections.
-        """
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(5)
-        print(f"[*] Listening on {self.host}:{self.port}")
-
-        thread = threading.Thread(target=self._accept_connections, daemon=True)
-        thread.start()
+        print(f"[*] Listening on {self.node_id}")
+        threading.Thread(target=self._accept_connections, daemon=True).start()
 
     def _accept_connections(self):
-        """
-        Accepts incoming connections and starts a new thread to handle each one.
-        This method is intended to be run in a separate thread.
-        """
         while True:
             try:
                 client_socket, client_address = self.server_socket.accept()
-                print(f"[+] Accepted connection from {client_address[0]}:{client_address[1]}")
+                peer_id = f"{client_address[0]}:{client_address[1]}"
+                print(f"[+] Accepted connection from {peer_id}")
                 with self.lock:
                     self.peers.append(client_socket)
-
-                # Start a new thread to handle messages from this peer
-                peer_thread = threading.Thread(target=self.handle_peer_messages, args=(client_socket,), daemon=True)
-                peer_thread.start()
-            except socket.error as e: # Mais específico para erros de socket
+                threading.Thread(target=self.handle_peer_messages, args=(client_socket,), daemon=True).start()
+            except socket.error as e:
                 print(f"[!] Socket error accepting connections: {e}")
-                # Considerar se deve quebrar o loop ou apenas logar o erro e continuar
-                # Por enquanto, manter o break para evitar loops infinitos em certos erros.
                 break
             except Exception as e:
                 print(f"[!] Unexpected error accepting connections: {e}")
-                break # Exit loop on unexpected error
+                break
 
     def connect_to_peer(self, peer_host, peer_port):
-        """
-        Connects to a peer at the specified host and port.
-        """
         try:
             peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             peer_socket.connect((peer_host, peer_port))
-            print(f"[*] Connected to {peer_host}:{peer_port}")
+            peer_id = f"{peer_host}:{peer_port}"
+            print(f"[*] Connected to {peer_id}")
             with self.lock:
                 self.peers.append(peer_socket)
-
-            # Start a new thread to handle messages from this peer
-            peer_thread = threading.Thread(target=self.handle_peer_messages, args=(peer_socket,), daemon=True)
-            peer_thread.start()
+            threading.Thread(target=self.handle_peer_messages, args=(peer_socket,), daemon=True).start()
             return True
         except socket.error as e:
             print(f"[!] Failed to connect to {peer_host}:{peer_port}. Error: {e}")
             return False
 
+    def _get_peer_id(self, peer_socket_or_address_tuple):
+        if isinstance(peer_socket_or_address_tuple, socket.socket):
+            try:
+                peer_address_tuple = peer_socket_or_address_tuple.getpeername()
+                return f"{peer_address_tuple[0]}:{peer_address_tuple[1]}"
+            except socket.error: # pragma: no cover
+                return "unknown_peer_socket"
+        elif isinstance(peer_socket_or_address_tuple, tuple) and len(peer_socket_or_address_tuple) == 2:
+            return f"{peer_socket_or_address_tuple[0]}:{peer_socket_or_address_tuple[1]}"
+        return "unknown_peer_format" # pragma: no cover
+
+
+    def is_idle(self) -> bool:
+        """Verifica se o nó está atualmente processando alguma tarefa."""
+        with self.task_pool_lock:
+            if not self.processing_tasks:
+                return True
+            for task_info in self.processing_tasks.values():
+                if task_info.get('status') == 'processing':
+                    return False
+            return True
+
     def handle_peer_messages(self, peer_socket):
-        """
-        Listens for messages from a given peer socket and handles them.
-        """
+        peer_id = self._get_peer_id(peer_socket)
+        from message_formats import (parse_message, create_task_message,
+                                     create_result_message, create_no_task_available_message,
+                                     create_announce_task_message, create_request_task_message)
         while True:
             try:
                 data = peer_socket.recv(1024)
-                if not data:
-                    # Connection closed by peer
-                    print(f"[-] Peer {peer_socket.getpeername()} disconnected.")
+                if not data: # pragma: no cover (difícil de testar desconexão controlada em simulação)
+                    print(f"[-] Peer {peer_id} disconnected.")
                     with self.lock:
-                        if peer_socket in self.peers:
-                            self.peers.remove(peer_socket)
-                    peer_socket.close()
+                        if peer_socket in self.peers: self.peers.remove(peer_socket)
+                    if peer_socket.fileno() != -1: peer_socket.close()
                     break
 
                 message_str = data.decode('utf-8')
                 parsed_msg = parse_message(message_str)
-                peer_address_tuple = peer_socket.getpeername()
-                peer_address = f"{peer_address_tuple[0]}:{peer_address_tuple[1]}"
 
                 if parsed_msg:
                     msg_type = parsed_msg.get("type")
+
                     if msg_type == "task":
                         task_id = parsed_msg.get("task_id")
                         operation = parsed_msg.get("operation")
                         task_data = parsed_msg.get("data")
-                        print(f"\n[TASK_RECV] From {peer_address}: Task ID {task_id}, Op: {operation}, Data: {task_data}")
+                        assigned_to_worker = parsed_msg.get("assigned_to")
+
+                        if assigned_to_worker and assigned_to_worker != self.node_id:
+                            continue
+
+                        print(f"\n[TASK_ASSIGNED_TO_ME] From {peer_id} for me ({self.node_id}): Task ID {task_id}, Op: {operation}")
+
+                        with self.task_pool_lock:
+                            if task_id in self.processing_tasks and self.processing_tasks[task_id]['status'] == 'processing':
+                                print(f"  [INFO] Task {task_id} is already being processed. Ignoring duplicate assignment.")
+                                continue
+                            self.processing_tasks[task_id] = {
+                                'operation': operation, 'data': task_data,
+                                'requested_from': peer_id,
+                                'status': 'processing'
+                            }
 
                         if operation == "sum":
-                            if isinstance(task_data, list) and len(task_data) == 2:
+                            if isinstance(task_data, list) and len(task_data) >= 1:
                                 try:
-                                    num1 = float(task_data[0])
-                                    num2 = float(task_data[1])
-                                    result_value = num1 + num2
-                                    print(f"[TASK_PROC] Task {task_id}: {num1} + {num2} = {result_value}")
+                                    float_data = [float(x) for x in task_data]
+                                    result_value = sum(float_data)
+                                    print(f"  [TASK_PROC_WORKER] Node {self.node_id} processing Task {task_id}: sum({float_data}) = {result_value}")
                                     result_msg_str = create_result_message(task_id, result_value)
                                     self.send_message_to_peer(peer_socket, result_msg_str)
-                                    print(f"[RESULT_SENT] To {peer_address} for Task ID {task_id}")
-                                except (ValueError, TypeError) as e:
-                                    print(f"[!] Error processing 'sum' task {task_id}: Invalid data format - {e}")
-                                    error_msg_str = create_result_message(task_id, None, f"Invalid data for sum: {task_data}")
+                                    print(f"  [RESULT_SENT_WORKER] Node {self.node_id} sent result for Task {task_id} to {peer_id}")
+                                    with self.task_pool_lock:
+                                        if task_id in self.processing_tasks:
+                                            del self.processing_tasks[task_id]
+                                except Exception as e:
+                                    err_msg = f"Error during sum operation for task {task_id}: {e}"
+                                    print(f"  [!] {self.node_id}: {err_msg}")
+                                    error_msg_str = create_result_message(task_id, None, err_msg)
                                     self.send_message_to_peer(peer_socket, error_msg_str)
+                                    with self.task_pool_lock:
+                                        if task_id in self.processing_tasks: del self.processing_tasks[task_id]
                             else:
-                                print(f"[!] Error processing 'sum' task {task_id}: Data must be a list of two numbers.")
-                                error_msg_str = create_result_message(task_id, None, "Invalid data for sum operation, expected list of two numbers.")
+                                err_msg = "Data for sum must be a list of at least one number."
+                                print(f"  [!] Error processing 'sum' task {task_id} by {self.node_id}: {err_msg}")
+                                error_msg_str = create_result_message(task_id, None, err_msg)
                                 self.send_message_to_peer(peer_socket, error_msg_str)
+                                with self.task_pool_lock:
+                                     if task_id in self.processing_tasks: del self.processing_tasks[task_id]
                         else:
-                            print(f"[!] Unknown operation '{operation}' for task {task_id}.")
-                            error_msg_str = create_result_message(task_id, None, f"Unknown operation: {operation}")
+                            err_msg = f"Unknown operation '{operation}' for task {task_id}."
+                            print(f"  [!] {self.node_id}: {err_msg}")
+                            error_msg_str = create_result_message(task_id, None, err_msg)
                             self.send_message_to_peer(peer_socket, error_msg_str)
+                            with self.task_pool_lock:
+                                if task_id in self.processing_tasks: del self.processing_tasks[task_id]
 
                     elif msg_type == "result":
-                        task_id = parsed_msg.get("task_id")
-                        value = parsed_msg.get("value")
-                        error = parsed_msg.get("error")
-                        print(f"\n[RESULT_RECV] From {peer_address}: Task ID {task_id}, Value: {value}, Error: {error}")
+                        res_task_id = parsed_msg.get("task_id")
+                        res_value = parsed_msg.get("value")
+                        res_error = parsed_msg.get("error")
+                        with self.task_pool_lock:
+                            if res_task_id in self.offered_tasks:
+                                task_details = self.offered_tasks[res_task_id]
+                                if task_details['status'] == 'pending':
+                                    task_details['status'] = 'completed'
+                                    task_details['result'] = {'value': res_value, 'error': res_error}
+                                    worker_id_assigned = task_details.get('assigned_to', 'unknown worker')
+                                    print(f"\n[RESULT_RECV_FOR_OFFERED_TASK] Task {res_task_id} (offered by me, {self.node_id}) completed by {worker_id_assigned} (via {peer_id}). Value={res_value}, Error={res_error}.")
+                                else:
+                                    print(f"\n[WARN_RESULT] Received result for offered task {res_task_id} from {peer_id}, but status was '{task_details['status']}', not 'pending'. Discarding.")
+                            else:
+                                print(f"\n[WARN_RESULT] Received result for a task ({res_task_id}) not in offered_tasks of node {self.node_id}, from {peer_id}. Discarding.")
 
-                    elif msg_type == "generic_text": # Handling plain text messages separately
-                        text_content = parsed_msg.get("content", "")
-                        print(f"\n[MSG_RECV] Text from {peer_address}: {text_content}")
+                    elif msg_type == "request_task":
+                        worker_requesting_id = parsed_msg.get("worker_id", peer_id)
+                        print(f"\n[TASK_REQUEST_RECV] From worker {worker_requesting_id} (connection: {peer_id}) for a task.")
+                        assigned_task_package = None
+                        with self.task_pool_lock:
+                            for current_task_id_iter, task_info_iter in self.offered_tasks.items():
+                                if task_info_iter['status'] == 'available':
+                                    task_info_iter['status'] = 'pending'
+                                    task_info_iter['assigned_to'] = worker_requesting_id
+                                    assigned_task_package = task_info_iter.copy()
+                                    assigned_task_package['task_id'] = current_task_id_iter
+                                    break
+                        if assigned_task_package:
+                            assign_msg_str = create_task_message(
+                                operation=assigned_task_package['operation'], data=assigned_task_package['data'],
+                                task_id=assigned_task_package['task_id'], assigned_to=worker_requesting_id
+                            )
+                            self.send_message_to_peer(peer_socket, assign_msg_str)
+                            print(f"  [TASK_SENT_TO_WORKER] Task {assigned_task_package['task_id']} sent to worker {worker_requesting_id} (connection: {peer_id}).")
+                        else:
+                            no_task_msg_str = create_no_task_available_message(requester_node_id=self.node_id)
+                            self.send_message_to_peer(peer_socket, no_task_msg_str)
+                            print(f"  [NO_TASK_FOR_WORKER] No tasks currently available from {self.node_id} for worker {worker_requesting_id}. Sent NO_TASK_AVAILABLE.")
 
-                    else:
-                        print(f"\n[!] Received unknown message type '{msg_type}' from {peer_address}: {message_str}")
-                else:
-                    # If parse_message returns None, it might be a plain text message or malformed JSON
-                    # For backward compatibility or simple text chat, we can assume it's a plain text message if it doesn't parse.
-                    # However, the new design emphasizes JSON messages.
-                    # For now, let's log it as a potential issue if it's not explicitly a "generic_text" type message.
-                    # A better approach would be to wrap plain text in a JSON structure too.
-                    # For this iteration, let's assume non-JSON is an error or an old format.
-                    print(f"\n[!] Received malformed JSON or non-JSON message from {peer_address}: {message_str}")
+                    elif msg_type == "announce_task":
+                        announcer_node_id = parsed_msg.get("node_id", peer_id)
+                        task_count = parsed_msg.get("task_count", 0)
+                        print(f"\n[TASK_ANNOUNCEMENT_RECV] Node {announcer_node_id} (conn: {peer_id}) announced {task_count} task(s).")
+                        if self.node_id == announcer_node_id:
+                            pass
+                        elif self.is_idle() and task_count > 0:
+                            print(f"  [WORKER_ACTION] Node {self.node_id} is idle and tasks are available. Requesting task from {announcer_node_id}.")
+                            request_msg = create_request_task_message(worker_id=self.node_id)
+                            self.send_message_to_peer(peer_socket, request_msg)
+                        elif not self.is_idle():
+                            print(f"  [WORKER_INFO] Node {self.node_id} is busy, not requesting task from {announcer_node_id} now.")
+                        else:
+                             print(f"  [WORKER_INFO] Node {announcer_node_id} has no tasks currently, not requesting.")
 
-            except socket.error as e:
-                # Existing error handling for socket issues
-                print(f"[!] Socket error with {peer_socket.getpeername() if peer_socket.fileno() != -1 else 'disconnected peer'}: {e}")
+
+                    elif msg_type == "no_task_available":
+                        task_host_node_id = parsed_msg.get("requester_node_id", peer_id)
+                        print(f"\n[NO_TASK_INFO_RECV] Received NO_TASK_AVAILABLE from {task_host_node_id} (conn: {peer_id}). Will not request task from them now.")
+
+                    elif msg_type == "generic_text":
+                        content = parsed_msg.get("content", "")
+                        sender = parsed_msg.get("sender", peer_id)
+                        print(f"\n[MSG_RECV] Text from {sender} (via {peer_id}): {content}")
+
+                    else: # pragma: no cover
+                        print(f"\n[!] Received unknown message type '{msg_type}' from {peer_id}: {message_str[:200]}")
+                else: # pragma: no cover
+                    print(f"\n[!] Received malformed JSON from {peer_id}: {message_str[:200]}")
+
+            except socket.error as e: # pragma: no cover
+                peer_id_on_error = self._get_peer_id(peer_socket)
+                print(f"[!] Socket error with {peer_id_on_error}: {e}")
                 with self.lock:
-                    if peer_socket in self.peers:
-                        self.peers.remove(peer_socket)
-                if peer_socket.fileno() != -1:
-                    peer_socket.close()
+                    if peer_socket in self.peers: self.peers.remove(peer_socket)
+                if peer_socket.fileno() != -1: peer_socket.close()
                 break
-            except json.JSONDecodeError as e: # Specifically catch JSON decoding errors if parse_message raises it
-                peer_address_tuple = peer_socket.getpeername() if peer_socket.fileno() != -1 else ('unknown', 0)
-                peer_address = f"{peer_address_tuple[0]}:{peer_address_tuple[1]}"
-                print(f"\n[!] Failed to decode JSON from {peer_address}: {e}. Data: '{data.decode('utf-8', errors='ignore')}'")
-                # No need to remove peer here unless this is a frequent or malicious issue.
-            except Exception as e: # Catch other potential errors
-                peer_address_tuple = peer_socket.getpeername() if peer_socket.fileno() != -1 else ('unknown', 0)
-                peer_address = f"{peer_address_tuple[0]}:{peer_address_tuple[1]}"
-                print(f"[!] Unexpected error handling message from {peer_address}: {e}")
-                # Optionally, break or handle more gracefully
+            except json.JSONDecodeError as e: # pragma: no cover
+                decoded_data_snippet = data.decode('utf-8', errors='ignore')[:200]
+                print(f"\n[!] Failed to decode JSON from {peer_id}: {e}. Data: '{decoded_data_snippet}'")
+            except Exception as e: # pragma: no cover
+                print(f"[!] Unexpected error handling message from {peer_id}: {e}")
                 break
 
-
-    def send_message_to_peer(self, peer_socket, message_str_json): # Expects a JSON string
-        """
-        Sends a JSON string message to a specific peer.
-        """
+    def send_message_to_peer(self, peer_socket, message_str_json):
         try:
             peer_socket.sendall(message_str_json.encode('utf-8'))
-        except socket.error as e:
-            print(f"[!] Error sending message to {peer_socket.getpeername() if peer_socket.fileno() != -1 else 'disconnected peer'}: {e}")
+        except socket.error as e: # pragma: no cover
+            peer_id = self._get_peer_id(peer_socket)
+            print(f"[!] Error sending message to {peer_id}: {e}")
             with self.lock:
-                if peer_socket in self.peers:
-                    self.peers.remove(peer_socket)
-            if peer_socket.fileno() != -1:
-                peer_socket.close()
+                if peer_socket in self.peers: self.peers.remove(peer_socket)
+            if peer_socket.fileno() != -1: peer_socket.close()
 
-
-    def broadcast_message(self, message_str_json): # Expects a JSON string
-        """
-        Sends a JSON string message to all connected peers.
-        """
-        # No direct print here, sending function will confirm or error
-        # print(f"[*] Broadcasting message: {message_str_json}")
+    def broadcast_message(self, message_str_json):
         with self.lock:
             for peer_socket in list(self.peers):
-                try:
-                    self.send_message_to_peer(peer_socket, message_str_json)
-                except Exception as e: # Should be caught by send_message_to_peer, but as a safeguard
-                    print(f"[!] Error broadcasting to a peer (socket: {peer_socket.fileno()}): {e}")
+                self.send_message_to_peer(peer_socket, message_str_json)
+
+    def _announce_available_tasks(self):
+        from message_formats import create_announce_task_message
+        with self.task_pool_lock:
+            available_tasks_count = sum(1 for task_info in self.offered_tasks.values() if task_info['status'] == 'available')
+
+        if available_tasks_count > 0:
+            announce_msg_str = create_announce_task_message(node_id=self.node_id, task_count=available_tasks_count)
+            print(f"[*] Node {self.node_id} anunciando {available_tasks_count} tarefa(s) disponível(is)...")
+            self.broadcast_message(announce_msg_str)
+
+    def add_task_to_pool(self, operation: str, data: list, task_id:str = None) -> str:
+        if not task_id: # pragma: no cover - task_id é geralmente fornecido ou gerado internamente
+            task_id = uuid.uuid4().hex
+
+        task_details = {
+            'operation': operation, 'data': data,
+            'status': 'available', 'assigned_to': None, 'result': None
+        }
+        with self.task_pool_lock:
+            self.offered_tasks[task_id] = task_details
+            print(f"[*] Task {task_id} (Op: {operation}, Data: {data}) added to offered tasks pool by {self.node_id}.")
+
+        self._announce_available_tasks()
+        return task_id
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="P2P Node with Task/Result Exchange")
+    from message_formats import (create_task_message, create_result_message, parse_message,
+                                 create_announce_task_message, create_request_task_message,
+                                 create_no_task_available_message)
+
+    parser = argparse.ArgumentParser(description="P2P Node with Task Pool")
     parser.add_argument('port', type=int, help="Port for the node to listen on")
     parser.add_argument('--host', type=str, default='0.0.0.0', help="Host for the node to listen on (default: 0.0.0.0)")
     parser.add_argument('--peers', type=str, help="Comma-separated list of initial peers to connect to (e.g., 127.0.0.1:8001,127.0.0.1:8002)")
 
     args = parser.parse_args()
-
     initial_peer_list = []
     if args.peers:
         peers_str = args.peers.split(',')
         for peer_addr in peers_str:
             try:
-                host, port_str = peer_addr.split(':')
-                initial_peer_list.append((host, int(port_str)))
-            except ValueError:
+                host_val, port_str = peer_addr.split(':')
+                initial_peer_list.append((host_val, int(port_str)))
+            except ValueError: # pragma: no cover
                 print(f"[!] Invalid peer format: {peer_addr}. Skipping.")
 
-    # Create and start the P2P node
     node = P2PNode(args.host, args.port, initial_peer_list)
     node.start_listening()
 
-    print("\nNode started. Type 'quit' to exit.")
-    print("Commands:")
-    print("  task sum <num1> <num2>  (e.g., task sum 5 3)")
-    print("  text <your_message>     (e.g., text Hello everyone!)")
-    print("  (or just type your message for backward compatibility - will be wrapped as generic_text)")
-
+    print("\n--- P2P Task Pool Node ---")
+    print(f"Node ID: {node.node_id}")
+    print("Available commands:")
+    print("  add <op> <data...>  - Add a task to the pool (e.g., add sum 10 20 5)")
+    print("  status              - Show offered and processing tasks")
+    print("  text <message...>   - Send a generic text message to peers")
+    print("  quit                - Shutdown the node")
+    print("--------------------------")
 
     try:
         while True:
-            raw_input_message = input("> ")
-            if raw_input_message.lower() == 'quit':
-                break
-
-            if not raw_input_message:
-                continue
+            raw_input_message = input(f"{node.node_id}> ")
+            if not raw_input_message: continue # pragma: no cover
 
             parts = raw_input_message.split()
             command = parts[0].lower()
 
-            if command == "task" and len(parts) >= 4:
+            if command == 'quit':
+                break
+
+            elif command == "add" and len(parts) >= 3:
                 op_name = parts[1].lower()
+                data_args_str = parts[2:]
+                if not data_args_str: # pragma: no cover
+                    print(f"[!] 'add {op_name}' requires at least one data argument.")
+                    continue
                 try:
-                    data_args = [float(p) for p in parts[2:]] # Convert data parts to float
-                    if op_name == "sum" and len(data_args) == 2:
-                        # task_id will be generated by create_task_message
-                        task_msg_str = create_task_message(operation=op_name, data=data_args)
-                        print(f"[*] Broadcasting TASK: {task_msg_str}")
-                        node.broadcast_message(task_msg_str)
+                    # Para 'sum', converte para float. Outras operações podem manter strings ou ter sua própria conversão.
+                    if op_name == "sum":
+                        data_args = [float(p) for p in data_args_str]
+                    else: # Mantém como string para outras operações, podem ser processadas de forma diferente
+                        data_args = data_args_str
+                    node.add_task_to_pool(operation=op_name, data=data_args)
+                except ValueError: # pragma: no cover
+                    print(f"[!] Invalid data for 'add sum' command. All data arguments must be numbers. Got: {data_args_str}")
+
+            elif command == "status":
+                with node.task_pool_lock:
+                    print("\n--- Offered Tasks (by this node) ---")
+                    if node.offered_tasks:
+                        for tid, tinfo in node.offered_tasks.items():
+                            print(f"  ID: {tid}, Op: {tinfo['operation']}, Data: {tinfo['data']}, "
+                                  f"Status: {tinfo['status']}, Assigned: {tinfo.get('assigned_to')}, "
+                                  f"Result: {tinfo.get('result')}")
                     else:
-                        print(f"[!] Invalid task format. For sum, use: task sum <num1> <num2>. Got: {raw_input_message}")
-                except ValueError:
-                    print(f"[!] Invalid data for task. Numbers expected. Got: {parts[2:]}")
+                        print("  No tasks currently offered.")
+                    print("\n--- Processing Tasks (by this node for others) ---")
+                    if node.processing_tasks:
+                        for tid, tinfo in node.processing_tasks.items():
+                             print(f"  ID: {tid}, Op: {tinfo['operation']}, Data: {tinfo['data']}, "
+                                   f"Status: {tinfo['status']}, From: {tinfo.get('requested_from')}")
+                    else:
+                        print("  No tasks currently being processed for other nodes.")
+                    print("--------------------------------------\n")
 
             elif command == "text" and len(parts) > 1:
                 text_content = " ".join(parts[1:])
-                # Wrap plain text in a JSON structure for consistency
-                generic_msg_dict = {"type": "generic_text", "content": text_content}
-                generic_msg_str = json.dumps(generic_msg_dict)
-                print(f"[*] Broadcasting TEXT: {generic_msg_str}")
+                # Usar message_formats para criar a mensagem generic_text
+                from message_formats import create_generic_text_message # Importação local
+                generic_msg_str = create_generic_text_message(content=text_content, sender_id=node.node_id)
                 node.broadcast_message(generic_msg_str)
+                print(f"[*] Broadcasted TEXT: {text_content}")
 
-            else: # For backward compatibility or simple messages, wrap as generic_text
-                # This allows old nodes or simple text to still be somewhat processed
-                # Or, you could choose to disallow non-command inputs.
-                print(f"[*] Wrapping as generic text and broadcasting: {raw_input_message}")
-                generic_msg_dict = {"type": "generic_text", "content": raw_input_message}
-                generic_msg_str = json.dumps(generic_msg_dict)
-                node.broadcast_message(generic_msg_str)
+            else: # pragma: no cover
+                print(f"[!] Unknown command or invalid format: '{raw_input_message}'. Type 'help' for commands (not implemented yet).")
+                # Se desejar que texto solto seja enviado como generic_text:
+                # from message_formats import create_generic_text_message
+                # generic_msg_str = create_generic_text_message(content=raw_input_message, sender_id=node.node_id)
+                # node.broadcast_message(generic_msg_str)
+                # print(f"[*] Broadcasted raw input as TEXT: {raw_input_message}")
 
-    except KeyboardInterrupt:
-        print("\n[*] Shutting down node...")
+
+    except KeyboardInterrupt: # pragma: no cover
+        print("\n[*] User initiated shutdown (KeyboardInterrupt)...")
     finally:
+        print("\n[*] Shutting down node...")
         print("[*] Closing server socket...")
         if node.server_socket:
-            node.server_socket.close()
+            try: node.server_socket.close()
+            except socket.error as e: print(f"[!] Error closing server socket: {e}") # pragma: no cover
 
-        # Attempt to close all peer sockets gracefully
         print("[*] Closing peer connections...")
         with node.lock:
             for peer_sock in node.peers:
                 try:
-                    peer_sock.shutdown(socket.SHUT_RDWR) # Signal no more send/receive
-                    peer_sock.close()
-                except socket.error:
-                    pass # Ignore errors if socket already closed or problematic
-        print("[*] Node shut down.")
+                    if peer_sock.fileno() != -1:
+                        peer_sock.shutdown(socket.SHUT_RDWR)
+                        peer_sock.close()
+                except socket.error as e: # pragma: no cover
+                    if peer_sock.fileno() != -1:
+                        print(f"[!] Error closing peer socket (FD: {peer_sock.fileno()}): {e}")
+                    else:
+                        print(f"[!] Error closing an already closed/invalid peer socket: {e}")
+        print("[*] Node shut down complete.")
